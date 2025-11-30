@@ -1,16 +1,59 @@
-#
-# Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES, ALL RIGHTS RESERVED.
-#
-# This software product is a proprietary product of NVIDIA CORPORATION &
-# AFFILIATES (the "Company") and all right, title, and interest in and to the
-# software product, including all associated intellectual property rights, are
-# and shall remain exclusively with the Company.
-#
-# This software product is governed by the End User License Agreement
-# provided with the software product.
-#
+# SysArmor DPU 正则匹配规则 - 严格版
+# 严格按照原YAML规则条件转换为正则表达式
+# 格式: 规则ID, /正则表达式/
 
-# Date Format DD-MM-YYYY
-1, /((0[1-9]|[12]\d|3[01])-(0[1-9]|1[0-2])-[12]\d{3})/
-# Date Format DD.MM.YYYY
-2, /((0[1-9]|[12]\d|3[01])\.(0[1-9]|1[0-2])\.[12]\d{3})/
+# ========================================
+# 1. 危险文件删除操作 (file_deletion_dangerous)
+# 原条件: proc.name in ("rm", "shred", "wipe") and 
+#         (proc.cmdline regex "rm\\s+.*-[rf]" or 
+#          proc.cmdline contains "shred" or 
+#          proc.cmdline contains "wipe")
+# ========================================
+
+# 规则1: 匹配 proc.name = "rm" AND proc.cmdline 包含 "rm" 且带 -r 或 -f 参数
+1, /"proc\.name":\s*"rm".*"proc\.cmdline":\s*"rm\s+[^"]*-[rf]/
+
+# ========================================
+# 2. 可疑Sudo权限提升检测 (sudo_privilege_escalation)
+# 原条件: spawned_process and 
+#         proc.name = "sudo" and 
+#         proc.exe = "/usr/bin/sudo" and 
+#         (proc.cmdline contains "sudo su" or 
+#          proc.cmdline contains "sudo bash" or 
+#          proc.cmdline contains "sudo sh" or 
+#          proc.cmdline regex "sudo.*(rm|mv|cp|chmod|chown|passwd|usermod|useradd|userdel).*" or 
+#          (proc.cmdline startswith "sudo" and not proc.cmdline contains "systemctl status"))
+# ========================================
+
+# 规则2: 匹配 event_type = execve AND proc.name = "sudo" AND proc.exe = "/usr/bin/sudo" AND proc.cmdline 包含 "sudo su"
+2, /"event_type":\s*"execve".*"proc\.name":\s*"sudo".*"proc\.exe":\s*"\/usr\/bin\/sudo".*"proc\.cmdline":\s*"sudo\s+su/
+
+# 规则3: 匹配 event_type = execve AND proc.name = "sudo" AND proc.exe = "/usr/bin/sudo" AND proc.cmdline 包含 "sudo bash"
+3, /"event_type":\s*"execve".*"proc\.name":\s*"sudo".*"proc\.exe":\s*"\/usr\/bin\/sudo".*"proc\.cmdline":\s*"sudo\s+bash/
+
+# 规则4: 匹配 event_type = execve AND proc.name = "sudo" AND proc.exe = "/usr/bin/sudo" AND proc.cmdline 包含 "sudo sh"
+4, /"event_type":\s*"execve".*"proc\.name":\s*"sudo".*"proc\.exe":\s*"\/usr\/bin\/sudo".*"proc\.cmdline":\s*"sudo\s+sh[^a-z]/
+
+# 规则5: 匹配 event_type = execve AND proc.name = "sudo" AND proc.exe = "/usr/bin/sudo" AND proc.cmdline 包含 sudo + 危险命令
+5, /"event_type":\s*"execve".*"proc\.name":\s*"sudo".*"proc\.exe":\s*"\/usr\/bin\/sudo".*"proc\.cmdline":\s*"sudo\s+[^"]*\b(rm|mv|cp|chmod|chown|passwd|usermod|useradd|userdel)\b/
+
+# 规则6: 匹配 event_type = execve AND proc.name = "sudo" AND proc.exe = "/usr/bin/sudo" AND proc.cmdline 以 "sudo" 开头但不包含 "systemctl status"
+6, /"event_type":\s*"execve".*"proc\.name":\s*"sudo".*"proc\.exe":\s*"\/usr\/bin\/sudo".*"proc\.cmdline":\s*"sudo\s+(?!.*systemctl\s+status)/
+
+# ========================================
+# 3. 日志访问或修改活动检测 (clear_log_activities)
+# 原条件: file_open and log_file_access
+# 展开: evt.type in (file_open_syscalls) and 
+#       (fd.name startswith "/var/log/" or 
+#        fd.name contains "syslog" or 
+#        fd.name contains "auth.log")
+# ========================================
+
+# 规则7: 匹配 event_type = open/openat/openat2 AND fd.name 以 "/var/log/" 开头
+7, /"event_type":\s*"open(at|at2)?".*"fd\.name":\s*"\/var\/log\//
+
+# 规则8: 匹配 event_type = open/openat/openat2 AND fd.name 包含 "syslog"
+8, /"event_type":\s*"open(at|at2)?".*"fd\.name":\s*"[^"]*syslog/
+
+# 规则9: 匹配 event_type = open/openat/openat2 AND fd.name 包含 "auth.log"
+9, /"event_type":\s*"open(at|at2)?".*"fd\.name":\s*"[^"]*auth\.log/
