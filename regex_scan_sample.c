@@ -113,6 +113,98 @@ regex_scan_report_results(struct regex_scan_ctx *regex_cfg, struct doca_event *e
 }
 
 /*
+ * Initialize DOCA RegEx resources for line-by-line mode (without pre-allocated data buffer)
+ *
+ * @regex_cfg [in]: RegEx configuration struct
+ * @line_buffer [in]: Buffer for single line processing
+ * @buffer_size [in]: Size of the line buffer
+ * @return: DOCA_SUCCESS on success and DOCA_ERROR otherwise
+ */
+static doca_error_t
+regex_scan_init_for_lines(struct regex_scan_ctx *regex_cfg, void *line_buffer, size_t buffer_size)
+{
+	doca_error_t result = DOCA_SUCCESS;
+	const int mempool_size = 8;
+
+	/* Find doca_dev according to the PCI address */
+	result = open_doca_device_with_pci(regex_cfg->pci_address, NULL, &regex_cfg->dev);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("No device matching PCI address found");
+		return result;
+	}
+
+	/* Create a DOCA RegEx instance */
+	result = doca_regex_create(&(regex_cfg->doca_regex));
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Unable to create RegEx device");
+		return result;
+	}
+
+	/* Set the RegEx device as the main HW accelerator */
+	result = doca_ctx_dev_add(doca_regex_as_ctx(regex_cfg->doca_regex), regex_cfg->dev);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Unable to set RegEx device. Reason: %s", doca_get_error_string(result));
+		return result;
+	}
+
+	/* Size per workq memory pool */
+	result = doca_regex_set_workq_matches_memory_pool_size(regex_cfg->doca_regex, mempool_size);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Unable set matches mempool size. Reason: %s", doca_get_error_string(result));
+		return result;
+	}
+
+	/* Load compiled rules into the RegEx */
+	result = doca_regex_set_hardware_compiled_rules(
+		regex_cfg->doca_regex, regex_cfg->rules_buffer, regex_cfg->rules_buffer_len);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Unable to program rules file. Reason: %s", doca_get_error_string(result));
+		return result;
+	}
+
+	/* Create and start buffer inventory */
+	result = doca_buf_inventory_create(NULL, 1, DOCA_BUF_EXTENSION_NONE, &regex_cfg->buf_inv);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Unable to create buffer inventory. Reason: %s", doca_get_error_string(result));
+		return result;
+	}
+
+	result = doca_buf_inventory_start(regex_cfg->buf_inv);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Unable to start buffer inventory. Reason: %s", doca_get_error_string(result));
+		return result;
+	}
+
+	/* Create and start mmap for line buffer */
+	result = doca_mmap_create(NULL, &regex_cfg->mmap);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Unable to create memory map. Reason: %s", doca_get_error_string(result));
+		return result;
+	}
+
+	result = doca_mmap_dev_add(regex_cfg->mmap, regex_cfg->dev);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Unable to add device to memory map. Reason: %s", doca_get_error_string(result));
+		return result;
+	}
+
+	/* Set memory range for line buffer */
+	result = doca_mmap_set_memrange(regex_cfg->mmap, line_buffer, buffer_size);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Unable to set memory region of memory map. Reason: %s", doca_get_error_string(result));
+		return result;
+	}
+
+	result = doca_mmap_start(regex_cfg->mmap);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Unable to start memory map. Reason: %s", doca_get_error_string(result));
+		return result;
+	}
+
+	return DOCA_SUCCESS;
+}
+
+/*
  * Initialize DOCA RegEx resources according to the configuration struct fields
  *
  * @regex_cfg [in]: RegEx configuration struct
@@ -530,23 +622,31 @@ regex_scan_lines(const char *data_file_path, const char *pci_addr, char *rules_b
 
 	doca_error_t result;
 	FILE *fp = NULL;
-	char *line = NULL;
+	char *line_buffer = NULL;
 	size_t line_cap = 0;
 	ssize_t line_len;
 	uint64_t line_number = 0;
 	uint64_t total_matches = 0;
 	struct regex_scan_ctx rgx_cfg = {0};
+	const size_t max_line_size = 1024 * 1024; /* 1MB max line size */
+
+	/* Allocate a fixed-size buffer for line processing */
+	line_buffer = (char *)malloc(max_line_size);
+	if (line_buffer == NULL) {
+		DOCA_LOG_ERR("Failed to allocate line buffer");
+		return DOCA_ERROR_NO_MEMORY;
+	}
 
 	/* Set DOCA RegEx configuration */
 	rgx_cfg.rules_buffer = rules_buffer;
 	rgx_cfg.rules_buffer_len = rules_buffer_len;
 	rgx_cfg.pci_address = pci_addr;
-	rgx_cfg.chunk_len = 64 * 1024; /* Not really used in line mode, but required for init */
 
-	/* Init DOCA RegEx */
-	result = regex_scan_init(&rgx_cfg);
+	/* Init DOCA RegEx with line buffer */
+	result = regex_scan_init_for_lines(&rgx_cfg, line_buffer, max_line_size);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to initialize RegEx: %s", doca_get_error_string(result));
+		free(line_buffer);
 		regex_scan_destroy(&rgx_cfg);
 		return result;
 	}
@@ -574,10 +674,20 @@ regex_scan_lines(const char *data_file_path, const char *pci_addr, char *rules_b
 		return result;
 	}
 
+	/* Allocate results array */
+	rgx_cfg.results = (struct doca_regex_search_result *)malloc(sizeof(struct doca_regex_search_result));
+	if (rgx_cfg.results == NULL) {
+		DOCA_LOG_ERR("Failed to allocate results buffer");
+		free(line_buffer);
+		regex_scan_destroy(&rgx_cfg);
+		return DOCA_ERROR_NO_MEMORY;
+	}
+
 	/* Open data file */
 	fp = fopen(data_file_path, "r");
 	if (fp == NULL) {
 		DOCA_LOG_ERR("Failed to open data file: %s", data_file_path);
+		free(line_buffer);
 		regex_scan_destroy(&rgx_cfg);
 		return DOCA_ERROR_IO_FAILED;
 	}
@@ -585,16 +695,17 @@ regex_scan_lines(const char *data_file_path, const char *pci_addr, char *rules_b
 	DOCA_LOG_INFO("Starting line-by-line RegEx scan on: %s", data_file_path);
 
 	/* Process file line by line */
-	while ((line_len = getline(&line, &line_cap, fp)) > 0) {
+	while (fgets(line_buffer, max_line_size, fp) != NULL) {
 		line_number++;
+		line_len = strlen(line_buffer);
 		
 		/* Remove trailing newline if present */
-		if (line[line_len - 1] == '\n') {
-			line[line_len - 1] = '\0';
+		if (line_len > 0 && line_buffer[line_len - 1] == '\n') {
+			line_buffer[line_len - 1] = '\0';
 			line_len--;
 		}
-		if (line_len > 0 && line[line_len - 1] == '\r') {
-			line[line_len - 1] = '\0';
+		if (line_len > 0 && line_buffer[line_len - 1] == '\r') {
+			line_buffer[line_len - 1] = '\0';
 			line_len--;
 		}
 
@@ -603,7 +714,7 @@ regex_scan_lines(const char *data_file_path, const char *pci_addr, char *rules_b
 			continue;
 
 		/* Process this line */
-		result = regex_scan_process_line(&rgx_cfg, line, line_len, line_number);
+		result = regex_scan_process_line(&rgx_cfg, line_buffer, line_len, line_number);
 		if (result != DOCA_SUCCESS) {
 			DOCA_LOG_WARN("Failed to process line %lu, skipping...", line_number);
 			continue;
@@ -618,10 +729,10 @@ regex_scan_lines(const char *data_file_path, const char *pci_addr, char *rules_b
 	DOCA_LOG_INFO("Completed scanning %lu lines", line_number);
 
 	/* Cleanup */
-	if (line != NULL)
-		free(line);
 	if (fp != NULL)
 		fclose(fp);
+	if (line_buffer != NULL)
+		free(line_buffer);
 	regex_scan_destroy(&rgx_cfg);
 
 	return DOCA_SUCCESS;
