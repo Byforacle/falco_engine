@@ -49,7 +49,26 @@ sample_inc_dirs += include_directories('../../..')
 # Common DOCA logic (applications)
 sample_inc_dirs += include_directories('../../../applications/common/src')
 
+# 原始的全文扫描程序
 executable('doca_' + SAMPLE_NAME, sample_srcs,
+	c_args : '-Wno-missing-braces',
+	dependencies : sample_dependencies,
+	include_directories: sample_inc_dirs,
+	install: false)
+
+# 新的按行扫描JSON数据程序
+sample_line_srcs = [
+	# The sample itself
+	SAMPLE_NAME + '_sample.c',
+	# Main function for line-by-line scanning
+	SAMPLE_NAME + '_line_main.c',
+	# Common code for all DOCA samples
+	'../../common.c',
+	# Common code for all DOCA applications
+	'../../../applications/common/src/utils.c',
+]
+
+executable('doca_' + SAMPLE_NAME + '_lines', sample_line_srcs,
 	c_args : '-Wno-missing-braces',
 	dependencies : sample_dependencies,
 	include_directories: sample_inc_dirs,

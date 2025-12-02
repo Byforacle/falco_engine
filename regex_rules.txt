@@ -38,7 +38,11 @@
 5, /"event_type":\s*"execve".*"proc\.name":\s*"sudo".*"proc\.exe":\s*"\/usr\/bin\/sudo".*"proc\.cmdline":\s*"sudo\s+[^"]*\b(rm|mv|cp|chmod|chown|passwd|usermod|useradd|userdel)\b/
 
 # 规则6: 匹配 event_type = execve AND proc.name = "sudo" AND proc.exe = "/usr/bin/sudo" AND proc.cmdline 以 "sudo" 开头但不包含 "systemctl status"
-6, /"event_type":\s*"execve".*"proc\.name":\s*"sudo".*"proc\.exe":\s*"\/usr\/bin\/sudo".*"proc\.cmdline":\s*"sudo\s+(?!.*systemctl\s+status)/
+# 6a: 匹配所有以sudo开头的命令
+6, /"event_type":\s*"execve".*"proc\.name":\s*"sudo".*"proc\.exe":\s*"\/usr\/bin\/sudo".*"proc\.cmdline":\s*"sudo\s+/
+
+# 6b: 匹配包含systemctl status的sudo命令（用于后处理过滤）
+7, /"event_type":\s*"execve".*"proc\.name":\s*"sudo".*"proc\.exe":\s*"\/usr\/bin\/sudo".*"proc\.cmdline":\s*"sudo\s+[^"]*systemctl\s+status/
 
 # ========================================
 # 3. 日志访问或修改活动检测 (clear_log_activities)
@@ -50,10 +54,10 @@
 # ========================================
 
 # 规则7: 匹配 event_type = open/openat/openat2 AND fd.name 以 "/var/log/" 开头
-7, /"event_type":\s*"open(at|at2)?".*"fd\.name":\s*"\/var\/log\//
+8, /"event_type":\s*"open(at|at2)?".*"fd\.name":\s*"\/var\/log\//
 
 # 规则8: 匹配 event_type = open/openat/openat2 AND fd.name 包含 "syslog"
-8, /"event_type":\s*"open(at|at2)?".*"fd\.name":\s*"[^"]*syslog/
+9, /"event_type":\s*"open(at|at2)?".*"fd\.name":\s*"[^"]*syslog/
 
 # 规则9: 匹配 event_type = open/openat/openat2 AND fd.name 包含 "auth.log"
-9, /"event_type":\s*"open(at|at2)?".*"fd\.name":\s*"[^"]*auth\.log/
+10, /"event_type":\s*"open(at|at2)?".*"fd\.name":\s*"[^"]*auth\.log/

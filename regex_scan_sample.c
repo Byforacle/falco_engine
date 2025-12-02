@@ -52,6 +52,36 @@ struct regex_scan_ctx {
 };
 
 /*
+ * Printing the RegEx results for line-by-line mode
+ *
+ * @line_number [in]: current line number being processed
+ * @line_data [in]: the complete JSON line data
+ * @result [in]: DOCA regex search result
+ */
+static void
+regex_scan_report_line_results(uint64_t line_number, const char *line_data, struct doca_regex_search_result *result)
+{
+	struct doca_regex_match *ptr;
+
+	if (result->num_matches == 0)
+		return;
+	
+	ptr = result->matches;
+	while (ptr != NULL) {
+		DOCA_LOG_INFO("=== MATCH FOUND ===");
+		DOCA_LOG_INFO("Line number: %lu", line_number);
+		DOCA_LOG_INFO("Rule ID: %d", ptr->rule_id);
+		DOCA_LOG_INFO("Match position: %u (length: %u)", ptr->match_start, ptr->length);
+		DOCA_LOG_INFO("Full JSON line: %s", line_data);
+		DOCA_LOG_INFO("==================");
+		
+		struct doca_regex_match *const to_release_match = ptr;
+		ptr = ptr->next;
+		doca_regex_mempool_put_obj(result->matches_mempool, to_release_match);
+	}
+}
+
+/*
  * Printing the RegEx results
  *
  * @regex_cfg [in]: sample RegEx configuration struct
@@ -407,5 +437,192 @@ regex_scan(char *data_buffer, size_t data_buffer_len, const char *pci_addr, char
 
 	/* RegEx scan recognition cleanup */
 	regex_scan_destroy(&rgx_cfg);
+	return DOCA_SUCCESS;
+}
+
+/*
+ * Process a single line (JSON) with RegEx
+ *
+ * @regex_cfg [in]: RegEx context
+ * @line_data [in]: Single line of data (JSON string)
+ * @line_len [in]: Length of the line
+ * @line_number [in]: Line number for reporting
+ * @return: DOCA_SUCCESS on success and DOCA_ERROR otherwise
+ */
+static doca_error_t
+regex_scan_process_line(struct regex_scan_ctx *regex_cfg, char *line_data, size_t line_len, uint64_t line_number)
+{
+	doca_error_t result;
+	struct doca_buf *buf = NULL;
+	struct doca_regex_job_search job_request = {0};
+	struct doca_event event = {0};
+	void *mbuf_data;
+	struct timespec ts = {
+		.tv_sec = 0,
+		.tv_nsec = SLEEP_IN_NANOS,
+	};
+
+	/* Create buffer for this line */
+	result = doca_buf_inventory_buf_by_addr(regex_cfg->buf_inv, regex_cfg->mmap,
+						line_data, line_len, &buf);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Failed to create buffer for line %lu", line_number);
+		return result;
+	}
+
+	doca_buf_get_data(buf, &mbuf_data);
+	doca_buf_set_data(buf, mbuf_data, line_len);
+
+	/* Prepare job request */
+	job_request.base.type = DOCA_REGEX_JOB_SEARCH;
+	job_request.base.ctx = doca_regex_as_ctx(regex_cfg->doca_regex);
+	job_request.base.user_data.u64 = line_number;
+	job_request.buffer = buf;
+	job_request.result = regex_cfg->results;
+	job_request.rule_group_ids[0] = 1;
+	job_request.allow_batching = false;
+
+	/* Submit job */
+	result = doca_workq_submit(regex_cfg->workq, (struct doca_job *)&job_request);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Failed to submit job for line %lu: %s", 
+			     line_number, doca_get_error_string(result));
+		doca_buf_refcount_rm(buf, NULL);
+		return result;
+	}
+
+	/* Wait for result */
+	do {
+		result = doca_workq_progress_retrieve(regex_cfg->workq, &event, DOCA_WORKQ_RETRIEVE_FLAGS_NONE);
+		if (result == DOCA_ERROR_AGAIN) {
+			nanosleep(&ts, &ts);
+		} else if (result != DOCA_SUCCESS) {
+			DOCA_LOG_ERR("Failed to retrieve result for line %lu: %s",
+				     line_number, doca_get_error_string(result));
+			doca_buf_refcount_rm(buf, NULL);
+			return result;
+		}
+	} while (result == DOCA_ERROR_AGAIN);
+
+	/* Report results for this line */
+	regex_scan_report_line_results(line_number, line_data, 
+				       (struct doca_regex_search_result *)event.result.ptr);
+
+	/* Cleanup */
+	doca_buf_refcount_rm(buf, NULL);
+	return DOCA_SUCCESS;
+}
+
+/*
+ * Run DOCA RegEx in line-by-line mode for JSON data
+ *
+ * @data_file_path [in]: Path to the data file (JSON lines)
+ * @pci_addr [in]: PCI address for HW RegEx device
+ * @rules_buffer [in]: Rules data (compiled rules)
+ * @rules_buffer_len [in]: rules_buffer length
+ * @return: DOCA_SUCCESS on success and DOCA_ERROR otherwise
+ */
+doca_error_t
+regex_scan_lines(const char *data_file_path, const char *pci_addr, char *rules_buffer, size_t rules_buffer_len)
+{
+	if (data_file_path == NULL || pci_addr == NULL || rules_buffer == NULL || rules_buffer_len == 0)
+		return DOCA_ERROR_INVALID_VALUE;
+
+	doca_error_t result;
+	FILE *fp = NULL;
+	char *line = NULL;
+	size_t line_cap = 0;
+	ssize_t line_len;
+	uint64_t line_number = 0;
+	uint64_t total_matches = 0;
+	struct regex_scan_ctx rgx_cfg = {0};
+
+	/* Set DOCA RegEx configuration */
+	rgx_cfg.rules_buffer = rules_buffer;
+	rgx_cfg.rules_buffer_len = rules_buffer_len;
+	rgx_cfg.pci_address = pci_addr;
+	rgx_cfg.chunk_len = 64 * 1024; /* Not really used in line mode, but required for init */
+
+	/* Init DOCA RegEx */
+	result = regex_scan_init(&rgx_cfg);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Failed to initialize RegEx: %s", doca_get_error_string(result));
+		regex_scan_destroy(&rgx_cfg);
+		return result;
+	}
+
+	/* Start DOCA RegEx */
+	result = doca_ctx_start(doca_regex_as_ctx(rgx_cfg.doca_regex));
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Unable to start DOCA RegEx: %s", doca_get_error_string(result));
+		regex_scan_destroy(&rgx_cfg);
+		return result;
+	}
+
+	/* Create work queue */
+	result = doca_workq_create(1, &(rgx_cfg.workq));
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Unable to create work queue: %s", doca_get_error_string(result));
+		regex_scan_destroy(&rgx_cfg);
+		return result;
+	}
+
+	result = doca_ctx_workq_add(doca_regex_as_ctx(rgx_cfg.doca_regex), rgx_cfg.workq);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Unable to attach work queue to RegEx: %s", doca_get_error_string(result));
+		regex_scan_destroy(&rgx_cfg);
+		return result;
+	}
+
+	/* Open data file */
+	fp = fopen(data_file_path, "r");
+	if (fp == NULL) {
+		DOCA_LOG_ERR("Failed to open data file: %s", data_file_path);
+		regex_scan_destroy(&rgx_cfg);
+		return DOCA_ERROR_IO_FAILED;
+	}
+
+	DOCA_LOG_INFO("Starting line-by-line RegEx scan on: %s", data_file_path);
+
+	/* Process file line by line */
+	while ((line_len = getline(&line, &line_cap, fp)) > 0) {
+		line_number++;
+		
+		/* Remove trailing newline if present */
+		if (line[line_len - 1] == '\n') {
+			line[line_len - 1] = '\0';
+			line_len--;
+		}
+		if (line_len > 0 && line[line_len - 1] == '\r') {
+			line[line_len - 1] = '\0';
+			line_len--;
+		}
+
+		/* Skip empty lines */
+		if (line_len == 0)
+			continue;
+
+		/* Process this line */
+		result = regex_scan_process_line(&rgx_cfg, line, line_len, line_number);
+		if (result != DOCA_SUCCESS) {
+			DOCA_LOG_WARN("Failed to process line %lu, skipping...", line_number);
+			continue;
+		}
+
+		/* Progress indicator every 1000 lines */
+		if (line_number % 1000 == 0) {
+			DOCA_LOG_INFO("Processed %lu lines...", line_number);
+		}
+	}
+
+	DOCA_LOG_INFO("Completed scanning %lu lines", line_number);
+
+	/* Cleanup */
+	if (line != NULL)
+		free(line);
+	if (fp != NULL)
+		fclose(fp);
+	regex_scan_destroy(&rgx_cfg);
+
 	return DOCA_SUCCESS;
 }
